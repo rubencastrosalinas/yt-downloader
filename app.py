@@ -11,6 +11,7 @@ app = Flask(__name__)
 FFMPEG = r"C:\Users\sonru\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.1-full_build\bin"
 COOKIES_YT = str(Path(__file__).parent.parent / "cookies cookies.txt")
 COOKIES_IG = str(Path(__file__).parent.parent / "cookies_instagram.txt")
+COOKIES_TK = str(Path(__file__).parent.parent / "cookies_tiktok.txt")
 DOWNLOAD_DIR = Path(__file__).parent / "downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
@@ -289,8 +290,8 @@ HTML = r"""<!DOCTYPE html>
   <div class="card">
     <div class="card-body">
       <div>
-        <label>URLs de YouTube o Instagram (una por línea)</label>
-        <textarea id="urls" placeholder="https://www.youtube.com/watch?v=...&#10;https://www.instagram.com/reel/..."></textarea>
+        <label>URLs de YouTube, Instagram o TikTok (una por línea)</label>
+        <textarea id="urls" placeholder="https://www.youtube.com/watch?v=...&#10;https://www.instagram.com/reel/...&#10;https://www.tiktok.com/@usuario/video/..."></textarea>
       </div>
 
       <div>
@@ -422,10 +423,15 @@ def run_download(job_id: str, url: str, fmt: str):
     import subprocess, re
 
     is_instagram = "instagram.com" in url
-    cookies_file = COOKIES_IG if is_instagram else COOKIES_YT
-    platform_msg = "Conectando con Instagram…" if is_instagram else "Conectando con YouTube…"
+    is_tiktok = "tiktok.com" in url
+    if is_instagram:
+        cookies_file, platform_msg = COOKIES_IG, "Conectando con Instagram…"
+    elif is_tiktok:
+        cookies_file, platform_msg = COOKIES_TK, "Conectando con TikTok…"
+    else:
+        cookies_file, platform_msg = COOKIES_YT, "Conectando con YouTube…"
 
-    yt_flags = [] if is_instagram else ["--js-runtimes", "node", "--remote-components", "ejs:github"]
+    yt_flags = ["--js-runtimes", "node", "--remote-components", "ejs:github"] if not is_instagram and not is_tiktok else []
 
     common = [
         "--cookies", cookies_file,

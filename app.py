@@ -1,4 +1,5 @@
 import os
+import tempfile
 import json
 import queue
 import threading
@@ -12,8 +13,10 @@ FFMPEG = r"C:\Users\sonru\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Mi
 COOKIES_YT = str(Path(__file__).parent.parent / "cookies cookies.txt")
 COOKIES_IG = str(Path(__file__).parent.parent / "cookies_instagram.txt")
 COOKIES_TK = str(Path(__file__).parent.parent / "cookies_tiktok.txt")
-DOWNLOAD_DIR = Path(__file__).parent / "downloads"
-DOWNLOAD_DIR.mkdir(exist_ok=True)
+# Fuera de Dropbox: su sincronizacion bloquea el archivo y yt-dlp falla al
+# renombrar el .temp.mp4 del merge video+audio (WinError 32).
+DOWNLOAD_DIR = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "ytdl" / "downloads"
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # job_id -> {"status": ..., "events": queue, "file": ...}
 jobs = {}

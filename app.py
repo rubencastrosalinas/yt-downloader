@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import json
 import queue
 import threading
@@ -15,8 +16,13 @@ COOKIES_IG = str(Path(__file__).parent.parent / "cookies_instagram.txt")
 COOKIES_TK = str(Path(__file__).parent.parent / "cookies_tiktok.txt")
 # Fuera de Dropbox: su sincronizacion bloquea el archivo y yt-dlp falla al
 # renombrar el .temp.mp4 del merge video+audio (WinError 32).
-DOWNLOAD_DIR = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "ytdl" / "downloads"
+# Tampoco en %LOCALAPPDATA%: el Python de Microsoft Store virtualiza esa ruta
+# y los archivos terminan escondidos dentro del paquete MSIX.
+DOWNLOAD_DIR = Path.home() / "Downloads" / "ytdl"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# Marca del ultimo intento de actualizar yt-dlp (para no hacerlo en cada arranque).
+STAMP = DOWNLOAD_DIR / ".yt_dlp_update"
 
 # job_id -> {"status": ..., "events": queue, "file": ...}
 jobs = {}
@@ -415,16 +421,59 @@ function listenJob(jobId) {
 """
 
 
-def run_download(job_id: str, url: str, fmt: str):
-    q = jobs[job_id]["events"]
-    out_dir = DOWNLOAD_DIR / job_id
-    out_dir.mkdir(exist_ok=True)
+def _yt_dlp_version() -> str:
+    import subprocess
+    try:
+        r = subprocess.run(["python", "-m", "yt_dlp", "--version"],
+                           capture_output=True, text=True, timeout=30)
+        return r.stdout.strip()
+    except Exception:
+        return "?"
 
-    def push(data: dict):
-        q.put(json.dumps(data))
 
-    import subprocess, re
+def update_yt_dlp() -> tuple:
+    """Actualiza yt-dlp. Devuelve (cambio, version_nueva)."""
+    import subprocess
+    before = _yt_dlp_version()
+    try:
+        subprocess.run(["python", "-m", "pip", "install", "--upgrade",
+                        "--disable-pip-version-check", "-q", "yt-dlp"],
+                       capture_output=True, text=True, timeout=300)
+    except Exception:
+        return (False, before)
+    after = _yt_dlp_version()
+    try:
+        STAMP.write_text(str(time.time()), encoding="utf-8")
+    except OSError:
+        pass
+    return (after != before, after)
 
+
+def maybe_update_yt_dlp(max_age_hours: int = 24) -> None:
+    """Actualiza si hace mas de max_age_hours del ultimo intento."""
+    try:
+        last = float(STAMP.read_text(encoding="utf-8"))
+    except Exception:
+        last = 0.0
+    if time.time() - last < max_age_hours * 3600:
+        return
+    update_yt_dlp()
+
+
+# YouTube rompe versiones viejas de yt-dlp cada pocas semanas; estas son las
+# firmas de ese fallo, distintas de un error real del video o de la red.
+STALE_SIGNS = (
+    "HTTP Error 403",
+    "Requested format is not available",
+    "The page needs to be reloaded",
+    "Sign in to confirm",
+    "nsig extraction failed",
+    "Only images are available",
+    "Failed to extract any player response",
+)
+
+
+def _build_cmd(url: str, fmt: str, out_dir) -> tuple:
     is_instagram = "instagram.com" in url
     is_tiktok = "tiktok.com" in url
     if is_instagram:
@@ -434,7 +483,7 @@ def run_download(job_id: str, url: str, fmt: str):
     else:
         cookies_file, platform_msg = COOKIES_YT, "Conectando con YouTube…"
 
-    yt_flags = ["--js-runtimes", "node", "--remote-components", "ejs:github"] if not is_instagram and not is_tiktok else []
+    yt_flags = ["--js-runtimes", "node", "--remote-components", "ejs:github"]         if not is_instagram and not is_tiktok else []
 
     common = [
         "--cookies", cookies_file,
@@ -445,27 +494,33 @@ def run_download(job_id: str, url: str, fmt: str):
         url,
     ]
     if fmt == "mp3":
-        cmd = ["python", "-m", "yt_dlp", "-x", "--audio-format", "mp3", "--audio-quality", "0"] + common
+        cmd = ["python", "-m", "yt_dlp", "-x", "--audio-format", "mp3",
+               "--audio-quality", "0"] + common
     else:
         cmd = ["python", "-m", "yt_dlp",
                "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
                "--merge-output-format", "mp4"] + common
+    return cmd, platform_msg
 
-    push({"msg": platform_msg})
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+
+def _attempt(cmd, push) -> tuple:
+    """Ejecuta yt-dlp. Devuelve (ok, ultimo_error)."""
+    import subprocess, re
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace")
+    last_error = None
 
     for line in proc.stdout:
         line = line.strip()
         if not line:
             continue
 
-        # Parse title from destination line
         m_dest = re.search(r"\[download\] Destination: .+[/\\](.+?)(?:\.(webm|mp4|m4a|mp3|opus))?$", line)
         if m_dest:
             push({"title": m_dest.group(1)})
             continue
 
-        # Progress line: [download]  45.3% of 12.34MiB at 2.1MiB/s ETA 00:03
         m = re.search(r"(\d+\.\d+)%.*?at\s+([\d.]+\S+)\s+ETA\s+(\S+)", line)
         if m:
             push({"pct": float(m.group(1)), "speed": m.group(2), "eta": m.group(3)})
@@ -476,20 +531,51 @@ def run_download(job_id: str, url: str, fmt: str):
             continue
 
         if "ERROR" in line:
-            push({"status": "error", "msg": line})
-            proc.wait()
-            return
+            last_error = line
+            continue
 
         if line.startswith("[") or "WARNING" in line:
             push({"msg": line[:80]})
 
     proc.wait()
-    if proc.returncode != 0:
-        push({"status": "error", "msg": f"yt-dlp salió con código {proc.returncode}"})
+    if proc.returncode != 0 or last_error:
+        return (False, last_error or f"yt-dlp salió con código {proc.returncode}")
+    return (True, None)
+
+
+def run_download(job_id: str, url: str, fmt: str):
+    q = jobs[job_id]["events"]
+    out_dir = DOWNLOAD_DIR / job_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def push(data: dict):
+        q.put(json.dumps(data))
+
+    cmd, platform_msg = _build_cmd(url, fmt, out_dir)
+    push({"msg": platform_msg})
+
+    ok, err = _attempt(cmd, push)
+
+    # Si fallo por una firma de yt-dlp desactualizado, actualiza y reintenta una vez.
+    if not ok and err and any(s in err for s in STALE_SIGNS):
+        push({"msg": "Actualizando yt-dlp…", "pct": 0})
+        changed, version = update_yt_dlp()
+        if changed:
+            for f in out_dir.iterdir():
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            push({"msg": f"Reintentando con yt-dlp {version}…"})
+            ok, err = _attempt(cmd, push)
+        else:
+            err = f"{err}  (yt-dlp {version} ya es la ultima version)"
+
+    if not ok:
+        push({"status": "error", "msg": err})
         return
 
-    # Find the output file
-    files = list(out_dir.iterdir())
+    files = [f for f in out_dir.iterdir() if f.is_file()]
     if not files:
         push({"status": "error", "msg": "No se encontró el archivo descargado"})
         return
@@ -497,7 +583,6 @@ def run_download(job_id: str, url: str, fmt: str):
     outfile = files[0]
     jobs[job_id]["file"] = outfile
     push({"status": "done", "filename": outfile.name, "pct": 100})
-
 
 @app.route("/")
 def index():
@@ -547,6 +632,11 @@ def serve_file(job_id):
         return "Not found", 404
     f = jobs[job_id]["file"]
     return send_file(f, as_attachment=True, download_name=f.name)
+
+
+# Chequeo diario de yt-dlp al arrancar, en segundo plano para no demorar el inicio.
+# Va a nivel de modulo: app_background.pyw importa `app` y no ejecuta __main__.
+threading.Thread(target=maybe_update_yt_dlp, daemon=True).start()
 
 
 if __name__ == "__main__":

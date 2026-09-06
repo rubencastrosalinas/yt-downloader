@@ -437,7 +437,7 @@ def update_yt_dlp() -> tuple:
     before = _yt_dlp_version()
     try:
         subprocess.run(["python", "-m", "pip", "install", "--upgrade",
-                        "--disable-pip-version-check", "-q", "yt-dlp"],
+                        "--disable-pip-version-check", "-q", "yt-dlp[default,curl-cffi]"],
                        capture_output=True, text=True, timeout=300)
     except Exception:
         return (False, before)
@@ -470,6 +470,8 @@ STALE_SIGNS = (
     "nsig extraction failed",
     "Only images are available",
     "Failed to extract any player response",
+    "Unexpected response from webpage request",
+    "no impersonate target is available",
 )
 
 
